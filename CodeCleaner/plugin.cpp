@@ -672,6 +672,37 @@ bool cleanCode(const cs_insn* insn, size_t codeCount)
 				}
 			}
 
+			cs_x86* x86_next = &(insn[i + 1].detail->x86);
+			//清理三个xor (reg, reg) -> xchg
+			if (insn[i + 1].id == X86_INS_XOR && insn[i].id == X86_INS_XOR && insn[i - 1].id == X86_INS_XOR
+				&& (x86_next->operands->type == X86_OP_REG && x86_last->operands->type == X86_OP_REG && x86_this->operands->type == X86_OP_REG))
+			{
+				if (x86_next->operands[0].reg == x86_last->operands[0].reg &&
+					x86_next->operands[1].reg == x86_last->operands[1].reg &&
+					x86_this->operands[0].reg == x86_last->operands[1].reg &&
+					x86_this->operands[1].reg == x86_last->operands[0].reg
+					)
+				{
+
+					Environment env;
+					env.setArch(Arch::kX64);
+					//Asmjit 初始化
+					CodeHolder code;
+					code.init(env);
+					x86::Assembler a(&code);
+					a.xchg(cvrtCsRegToGp(x86_this->operands[0].reg), cvrtCsRegToGp(x86_this->operands[1].reg));
+					DbgFunctions()->AssembleAtEx(insn[i-1].address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(insn[i].address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(insn[i+1].address, "NOP", 0, true);
+					PBYTE tCode = new BYTE[code.codeSize()];
+					code.copyFlattenedData(tCode, code.codeSize());
+					DbgFunctions()->MemPatch(insn[last].address, tCode, code.codeSize());
+				}
+				modified = true;
+				break;
+			}
+
+
 			//上上一行指令
 			int last2 = getLastInsIndex(insn, (int)last);
 			//有前两行指令
