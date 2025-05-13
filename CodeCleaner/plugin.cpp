@@ -192,6 +192,24 @@ int getLastInsIndex(const cs_insn* insn, int now_index)
 	return result;
 }
 
+static uint32_t getRegByteSize(x86_reg cs_reg)
+{
+	using namespace asmjit::x86;
+
+	// 将 Capstone 寄存器转换为 AsmJit 寄存器
+	Gp reg = cvrtCsRegToGp(cs_reg); // 使用你已有的转换函数
+
+	// 获取字节数并返回
+	return reg.size();
+}
+
+static uint32_t getRegBitWidth(x86_reg cs_reg)
+{
+	return getRegByteSize(cs_reg) * 8; // 字节数 * 8 = 位数
+}
+
+
+
 bool cleanCode(const cs_insn* insn, size_t codeCount)
 {
 	bool modified = false;
@@ -691,9 +709,9 @@ bool cleanCode(const cs_insn* insn, size_t codeCount)
 					code.init(env);
 					x86::Assembler a(&code);
 					a.xchg(cvrtCsRegToGp(x86_this->operands[0].reg), cvrtCsRegToGp(x86_this->operands[1].reg));
-					DbgFunctions()->AssembleAtEx(insn[i-1].address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(insn[i - 1].address, "NOP", 0, true);
 					DbgFunctions()->AssembleAtEx(insn[i].address, "NOP", 0, true);
-					DbgFunctions()->AssembleAtEx(insn[i+1].address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(insn[i + 1].address, "NOP", 0, true);
 					PBYTE tCode = new BYTE[code.codeSize()];
 					code.copyFlattenedData(tCode, code.codeSize());
 					DbgFunctions()->MemPatch(insn[last].address, tCode, code.codeSize());
@@ -770,8 +788,891 @@ bool cleanCode(const cs_insn* insn, size_t codeCount)
 
 			}
 		}
+
+
+		// 处理 push reg; mov reg, imm; mov [rsp+8], reg; pop reg 的情况
+		if (insn[i].id == X86_INS_POP) {
+			cs_x86* x86_this = &(insn[i].detail->x86);
+			if (x86_this->operands[0].type == X86_OP_REG) {
+				x86_reg pop_reg = x86_this->operands[0].reg;
+
+				// 获取前三条有效指令索引
+				int last1 = getLastInsIndex(insn, i);
+				if (last1 == -1) continue;
+				int last2 = getLastInsIndex(insn, last1);
+				if (last2 == -1) continue;
+				int last3 = getLastInsIndex(insn, last2);
+				if (last3 == -1) continue;
+
+				// 验证四指令模式
+				const cs_insn* push_insn = &insn[last3];
+				const cs_insn* mov_imm_insn = &insn[last2];
+				const cs_insn* mov_mem_insn = &insn[last1];
+				const cs_insn* pop_insn = &insn[i];
+
+				if (push_insn->id == X86_INS_PUSH &&
+					push_insn->detail->x86.operands[0].type == X86_OP_REG &&
+					push_insn->detail->x86.operands[0].reg == pop_reg &&
+
+					mov_imm_insn->id == X86_INS_MOVABS &&
+					mov_imm_insn->detail->x86.operands[0].type == X86_OP_REG &&
+					mov_imm_insn->detail->x86.operands[0].reg == pop_reg &&
+
+					mov_imm_insn->detail->x86.operands[1].type == X86_OP_IMM &&
+					mov_mem_insn->id == X86_INS_MOV &&
+					mov_mem_insn->detail->x86.operands[0].type == X86_OP_MEM &&
+
+					mov_mem_insn->detail->x86.operands[0].mem.base == X86_REG_RSP &&
+					mov_mem_insn->detail->x86.operands[0].mem.disp == 8 &&
+					mov_mem_insn->detail->x86.operands[1].type == X86_OP_REG &&
+
+					mov_mem_insn->detail->x86.operands[1].reg == pop_reg &&
+					pop_insn->detail->x86.operands[0].reg == pop_reg) {
+
+					// 获取立即数值
+					uint64_t imm = mov_imm_insn->detail->x86.operands[1].imm;
+
+					// 清除原指令
+					DbgFunctions()->AssembleAtEx(push_insn->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(mov_imm_insn->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(mov_mem_insn->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(pop_insn->address, "NOP", 0, true);
+
+					// 生成 MOV [RSP], imm
+					Environment env;
+					env.setArch(Arch::kX64);
+					CodeHolder code;
+					code.init(env);
+					x86::Assembler a(&code);
+					a.mov(qword_ptr(rsp), imm);
+
+					PBYTE tCode = new BYTE[code.codeSize()];
+					code.copyFlattenedData(tCode, code.codeSize());
+					DbgFunctions()->MemPatch(push_insn->address, tCode, code.codeSize());
+					delete[] tCode;
+					code.reset();
+
+					modified = true;
+					break;
+				}
+			}
+		}
+
+		// 处理 push rcx; mov rcx, r15; mov r15, rcx; pop rcx;
+		if (insn[i].id == X86_INS_POP) {
+			cs_x86* x86_this = &(insn[i].detail->x86);
+			if (x86_this->operands[0].type == X86_OP_REG) {
+				x86_reg pop_reg = x86_this->operands[0].reg;
+
+				// 获取前三条有效指令索引
+				int last1 = getLastInsIndex(insn, i);
+				if (last1 == -1) continue;
+				int last2 = getLastInsIndex(insn, last1);
+				if (last2 == -1) continue;
+				int last3 = getLastInsIndex(insn, last2);
+				if (last3 == -1) continue;
+
+				// 验证四指令模式
+				const cs_insn* push_insn = &insn[last3];
+				const cs_insn* mov_reg2_reg1 = &insn[last2];
+				const cs_insn* mov_reg1_reg2 = &insn[last1];
+				const cs_insn* pop_insn = &insn[i];
+
+
+				if (push_insn->id == X86_INS_PUSH &&
+					push_insn->detail->x86.operands[0].type == X86_OP_REG &&
+					push_insn->detail->x86.operands[0].reg == pop_reg &&
+
+					mov_reg2_reg1->id == X86_INS_MOV &&
+					mov_reg2_reg1->detail->x86.operands[0].type == X86_OP_REG &&
+					mov_reg2_reg1->detail->x86.operands[0].reg == pop_reg &&
+					mov_reg2_reg1->detail->x86.operands[1].type == X86_OP_REG &&
+					mov_reg2_reg1->detail->x86.operands[1].reg == mov_reg1_reg2->detail->x86.operands[0].reg &&
+
+					mov_reg1_reg2->id == X86_INS_MOV &&
+					mov_reg1_reg2->detail->x86.operands[0].type == X86_OP_REG &&
+					mov_reg1_reg2->detail->x86.operands[0].reg == mov_reg2_reg1->detail->x86.operands[1].reg &&
+					mov_reg1_reg2->detail->x86.operands[1].type == X86_OP_REG &&
+					mov_reg1_reg2->detail->x86.operands[1].reg == pop_reg &&
+
+					pop_insn->detail->x86.operands[0].reg == pop_reg) {
+
+					// 清除原指令
+					DbgFunctions()->AssembleAtEx(push_insn->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(mov_reg2_reg1->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(mov_reg1_reg2->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(pop_insn->address, "NOP", 0, true);
+
+					modified = true;
+					break;
+				}
+			}
+		}
+
+		// 处理
+		/*
+		xor rdi,qword ptr ss:[rsp]
+		xor qword ptr ss:[rsp],rdi
+		xor rdi,qword ptr ss:[rsp]
+		*/
+		if (insn[i].id == X86_INS_XOR) {
+			cs_x86* x86_this = &(insn[i].detail->x86);
+			if (x86_this->operands[0].type == X86_OP_REG) {
+				// 获取前三条有效指令索引
+				int last1 = getLastInsIndex(insn, i);
+				if (last1 == -1) continue;
+				int last2 = getLastInsIndex(insn, last1);
+				if (last2 == -1) continue;
+
+				// 验证四指令模式
+				const cs_insn* xor_rdi_mem = &insn[last2];
+				const cs_insn* xor_mem_rdi = &insn[last1];
+				const cs_insn* xor_rdi_mem_1 = &insn[i];
+
+
+				if (xor_rdi_mem->id == X86_INS_XOR &&
+					xor_rdi_mem->detail->x86.operands[0].type == X86_OP_REG &&
+					xor_rdi_mem->detail->x86.operands[0].reg == xor_rdi_mem_1->detail->x86.operands[0].reg &&
+					xor_rdi_mem->detail->x86.operands[1].type == X86_OP_MEM &&
+					xor_rdi_mem->detail->x86.operands[1].mem.base == X86_REG_RSP &&
+					xor_rdi_mem->detail->x86.operands[1].mem.disp == 0 &&
+
+					xor_mem_rdi->id == X86_INS_XOR &&
+					xor_mem_rdi->detail->x86.operands[1].type == X86_OP_REG &&
+					xor_mem_rdi->detail->x86.operands[1].reg == xor_rdi_mem_1->detail->x86.operands[0].reg &&
+					xor_mem_rdi->detail->x86.operands[0].type == X86_OP_MEM &&
+					xor_mem_rdi->detail->x86.operands[0].mem.base == X86_REG_RSP &&
+					xor_mem_rdi->detail->x86.operands[0].mem.disp == 0 &&
+
+					xor_rdi_mem_1->id == X86_INS_XOR &&
+					xor_rdi_mem_1->detail->x86.operands[0].type == X86_OP_REG &&
+					xor_rdi_mem_1->detail->x86.operands[1].type == X86_OP_MEM &&
+					xor_rdi_mem_1->detail->x86.operands[1].mem.base == X86_REG_RSP &&
+					xor_rdi_mem_1->detail->x86.operands[1].mem.disp == 0)
+				{
+					// 清除原指令
+					DbgFunctions()->AssembleAtEx(xor_rdi_mem->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(xor_mem_rdi->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(xor_rdi_mem_1->address, "NOP", 0, true);
+
+
+					// 生成 XCHG [RSP], reg
+					Environment env;
+					env.setArch(Arch::kX64);
+					CodeHolder code;
+					code.init(env);
+					x86::Assembler a(&code);
+					a.xchg(qword_ptr(rsp), cvrtCsRegToGp(xor_rdi_mem_1->detail->x86.operands[0].reg));
+
+					PBYTE tCode = new BYTE[code.codeSize()];
+					code.copyFlattenedData(tCode, code.codeSize());
+					DbgFunctions()->MemPatch(xor_rdi_mem->address, tCode, code.codeSize());
+					delete[] tCode;
+					code.reset();
+
+
+					modified = true;
+					break;
+				}
+			}
+		}
+
+		// 处理
+		/*
+		add reg, Imm1
+		add reg, Imm2
+		*/
+		if (insn[i].id == X86_INS_ADD)
+		{
+			cs_x86* x86_this = &(insn[i].detail->x86);
+			if (x86_this->operands[0].type == X86_OP_REG)
+			{
+				// 获取前一条有效指令索引
+				int last1 = getLastInsIndex(insn, i);
+				if (last1 == -1) continue;
+
+				const cs_insn* add_r1 = &insn[last1];
+				const cs_insn* add_r2 = &insn[i];
+
+				if (add_r1->id == X86_INS_ADD &&
+					add_r2->id == X86_INS_ADD &&
+					add_r1->detail->x86.operands[0].type == X86_OP_REG &&
+					add_r2->detail->x86.operands[0].type == X86_OP_REG &&
+					add_r1->detail->x86.operands[1].type == X86_OP_IMM &&
+					add_r2->detail->x86.operands[1].type == X86_OP_IMM)
+				{
+					// 关键改进点：检查寄存器是否完全相同（包括位宽）
+					x86_reg reg1 = add_r1->detail->x86.operands[0].reg;
+					x86_reg reg2 = add_r2->detail->x86.operands[0].reg;
+					if (reg1 != reg2)
+						continue; // 寄存器不同则跳过
+
+					// 获取寄存器位宽
+					int reg_size = getRegBitWidth(reg1);
+					
+
+					// BUG
+					uint64_t max_imm = (1ULL << reg_size) - 1;
+					uint64_t imm_total =
+						add_r1->detail->x86.operands[1].imm +
+						add_r2->detail->x86.operands[1].imm;
+					_plugin_logprintf("imm_total=%llu", imm_total);
+					_plugin_logprintf("max_imm=%llu", max_imm);
+
+					if (imm_total > max_imm)
+						continue; // 立即数溢出则不优化
+
+
+
+					// 清除原指令
+					DbgFunctions()->AssembleAtEx(add_r1->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(add_r2->address, "NOP", 0, true);
+
+					// 生成新的 ADD 指令
+					Environment env;
+					env.setArch(Arch::kX64);
+					CodeHolder code;
+					code.init(env);
+					x86::Assembler a(&code);
+
+					// 根据寄存器位宽选择正确的操作数
+					switch (reg_size)
+					{
+					case 64:
+						a.add(cvrtCsRegToGp(reg1).r8(), imm_total & 0xffffffffffffffff);
+						break;
+
+					case 32:
+						a.add(cvrtCsRegToGp(reg1).r32(), imm_total & 0xffffffff);
+						break;
+					case 16:
+						a.add(cvrtCsRegToGp(reg1).r16(), imm_total & 0xffff);
+						break;
+					case 8:
+						a.add(cvrtCsRegToGp(reg1).r8(), imm_total & 0xff);
+						break;
+					}
+
+					// 写入原第一条 ADD 的地址
+					PBYTE tCode = new BYTE[code.codeSize()];
+					code.copyFlattenedData(tCode, code.codeSize());
+					DbgFunctions()->MemPatch(add_r1->address, tCode, code.codeSize());
+					delete[] tCode;
+					code.reset();
+
+					modified = true;
+					break;
+				}
+			}
+		}
+
+		//// 处理
+		///*
+		//sub reg, Imm1
+		//sub reg, Imm2
+		//*/
+		//if (insn[i].id == X86_INS_SUB) {
+		//	cs_x86* x86_this = &(insn[i].detail->x86);
+		//	if (x86_this->operands[0].type == X86_OP_REG) {
+		//		// 获取前三条有效指令索引
+		//		int last1 = getLastInsIndex(insn, i);
+		//		if (last1 == -1) continue;
+
+
+		//		// 验证四指令模式
+		//		const cs_insn* add_r1 = &insn[last1];
+		//		const cs_insn* add_r2 = &insn[i];
+
+
+		//		if (add_r1->id == X86_INS_SUB && add_r2->id == X86_INS_SUB &&
+
+		//			add_r1->detail->x86.operands[0].type == X86_OP_REG &&
+		//			add_r2->detail->x86.operands[0].type == X86_OP_REG &&
+
+		//			add_r1->detail->x86.operands[1].type == X86_OP_IMM &&
+		//			add_r2->detail->x86.operands[1].type == X86_OP_IMM &&
+
+		//			add_r1->detail->x86.operands[0].reg == add_r2->detail->x86.operands[0].reg)
+		//		{
+		//			// 清除原指令
+		//			DbgFunctions()->AssembleAtEx(add_r1->address, "NOP", 0, true);
+		//			DbgFunctions()->AssembleAtEx(add_r2->address, "NOP", 0, true);
+
+
+		//			// 生成 XCHG [RSP], reg
+		//			Environment env;
+		//			env.setArch(Arch::kX64);
+		//			CodeHolder code;
+		//			code.init(env);
+		//			x86::Assembler a(&code);
+		//			a.sub(cvrtCsRegToGp(add_r1->detail->x86.operands[0].reg),
+		//				add_r1->detail->x86.operands[1].imm + add_r2->detail->x86.operands[1].imm);
+
+		//			PBYTE tCode = new BYTE[code.codeSize()];
+		//			code.copyFlattenedData(tCode, code.codeSize());
+		//			DbgFunctions()->MemPatch(add_r2->address, tCode, code.codeSize());
+		//			delete[] tCode;
+		//			code.reset();
+
+		//			modified = true;
+		//			break;
+		//		}
+		//	}
+		//}
+
+		//// 处理
+		///*
+		//sub reg, Imm1
+		//add reg, Imm2
+		//*/
+		//if (insn[i].id == X86_INS_ADD) {
+		//	cs_x86* x86_this = &(insn[i].detail->x86);
+		//	if (x86_this->operands[0].type == X86_OP_REG) {
+		//		// 获取前三条有效指令索引
+		//		int last1 = getLastInsIndex(insn, i);
+		//		if (last1 == -1) continue;
+
+
+		//		// 验证四指令模式
+		//		const cs_insn* add_r1 = &insn[last1];
+		//		const cs_insn* add_r2 = &insn[i];
+
+
+		//		if (add_r1->id == X86_INS_SUB && add_r2->id == X86_INS_ADD &&
+
+		//			add_r1->detail->x86.operands[0].type == X86_OP_REG &&
+		//			add_r2->detail->x86.operands[0].type == X86_OP_REG &&
+
+		//			add_r1->detail->x86.operands[1].type == X86_OP_IMM &&
+		//			add_r2->detail->x86.operands[1].type == X86_OP_IMM &&
+
+		//			add_r1->detail->x86.operands[0].reg == add_r2->detail->x86.operands[0].reg)
+		//		{
+		//			// 清除原指令
+		//			DbgFunctions()->AssembleAtEx(add_r1->address, "NOP", 0, true);
+		//			DbgFunctions()->AssembleAtEx(add_r2->address, "NOP", 0, true);
+
+
+		//			// 生成 XCHG [RSP], reg
+		//			Environment env;
+		//			env.setArch(Arch::kX64);
+		//			CodeHolder code;
+		//			code.init(env);
+		//			x86::Assembler a(&code);
+		//			a.add(cvrtCsRegToGp(add_r1->detail->x86.operands[0].reg),
+		//				-add_r1->detail->x86.operands[1].imm + add_r2->detail->x86.operands[1].imm);
+
+		//			PBYTE tCode = new BYTE[code.codeSize()];
+		//			code.copyFlattenedData(tCode, code.codeSize());
+		//			DbgFunctions()->MemPatch(add_r2->address, tCode, code.codeSize());
+		//			delete[] tCode;
+		//			code.reset();
+
+		//			modified = true;
+		//			break;
+		//		}
+		//	}
+		//}
+		//
+		//// 处理
+		///*
+		//add reg, Imm1
+		//sub reg, Imm2
+		//*/
+		//if (insn[i].id == X86_INS_SUB) {
+		//	cs_x86* x86_this = &(insn[i].detail->x86);
+		//	if (x86_this->operands[0].type == X86_OP_REG) {
+		//		// 获取前三条有效指令索引
+		//		int last1 = getLastInsIndex(insn, i);
+		//		if (last1 == -1) continue;
+
+
+		//		// 验证四指令模式
+		//		const cs_insn* add_r1 = &insn[last1];
+		//		const cs_insn* add_r2 = &insn[i];
+
+
+		//		if (add_r1->id == X86_INS_ADD && add_r2->id == X86_INS_SUB &&
+
+		//			add_r1->detail->x86.operands[0].type == X86_OP_REG &&
+		//			add_r2->detail->x86.operands[0].type == X86_OP_REG &&
+
+		//			add_r1->detail->x86.operands[1].type == X86_OP_IMM &&
+		//			add_r2->detail->x86.operands[1].type == X86_OP_IMM &&
+
+		//			add_r1->detail->x86.operands[0].reg == add_r2->detail->x86.operands[0].reg)
+		//		{
+		//			// 清除原指令
+		//			DbgFunctions()->AssembleAtEx(add_r1->address, "NOP", 0, true);
+		//			DbgFunctions()->AssembleAtEx(add_r2->address, "NOP", 0, true);
+
+
+		//			// 生成 XCHG [RSP], reg
+		//			Environment env;
+		//			env.setArch(Arch::kX64);
+		//			CodeHolder code;
+		//			code.init(env);
+		//			x86::Assembler a(&code);
+		//			a.add(cvrtCsRegToGp(add_r1->detail->x86.operands[0].reg),
+		//				add_r1->detail->x86.operands[1].imm - add_r2->detail->x86.operands[1].imm);
+
+		//			PBYTE tCode = new BYTE[code.codeSize()];
+		//			code.copyFlattenedData(tCode, code.codeSize());
+		//			DbgFunctions()->MemPatch(add_r2->address, tCode, code.codeSize());
+		//			delete[] tCode;
+		//			code.reset();
+
+		//			modified = true;
+		//			break;
+		//		}
+		//	}
+		//}
+
+
+
+		// 处理
+		/*
+		push rdi
+		mov rdi,rsp
+		add rdi,0x10
+		xchg qword ptr ss:[rsp],rdi
+		pop rsp
+		*/
+		if (insn[i].id == X86_INS_POP) {
+			cs_x86* x86_this = &(insn[i].detail->x86);
+			if (x86_this->operands[0].type == X86_OP_REG && x86_this->operands[0].reg == X86_REG_RSP) {
+				// 获取前三条有效指令索引
+				int last1 = getLastInsIndex(insn, i);
+				if (last1 == -1) continue;
+
+				int last2 = getLastInsIndex(insn, last1);
+				if (last2 == -1) continue;
+
+				int last3 = getLastInsIndex(insn, last2);
+				if (last3 == -1) continue;
+
+				int last4 = getLastInsIndex(insn, last3);
+				if (last4 == -1) continue;
+
+
+				// 验证四指令模式
+				const cs_insn* push_rdi = &insn[last4];
+				const cs_insn* mov_rdi_rsp = &insn[last3];
+				const cs_insn* add_rdi_16 = &insn[last2];
+				const cs_insn* xchg_memRSP_rdi = &insn[last1];
+				const cs_insn* pop_rsp = &insn[i];
+				auto mainREG = push_rdi->detail->x86.operands[0].reg;
+
+				if (push_rdi->id == X86_INS_PUSH &&
+					push_rdi->detail->x86.operands[0].type == X86_OP_REG &&
+
+					mov_rdi_rsp->id == X86_INS_MOV &&
+					mov_rdi_rsp->detail->x86.operands[0].type == X86_OP_REG &&
+					mov_rdi_rsp->detail->x86.operands[0].reg == mainREG &&
+					mov_rdi_rsp->detail->x86.operands[1].type == X86_OP_REG &&
+					mov_rdi_rsp->detail->x86.operands[1].reg == X86_REG_RSP &&
+
+					add_rdi_16->id == X86_INS_ADD &&
+					add_rdi_16->detail->x86.operands[0].type == X86_OP_REG &&
+					add_rdi_16->detail->x86.operands[0].reg == mainREG &&
+					add_rdi_16->detail->x86.operands[1].type == X86_OP_IMM &&
+					add_rdi_16->detail->x86.operands[1].imm == 0x10 &&
+
+					xchg_memRSP_rdi->id == X86_INS_XCHG &&
+					xchg_memRSP_rdi->detail->x86.operands[0].type == X86_OP_MEM &&
+					xchg_memRSP_rdi->detail->x86.operands[0].mem.base == X86_REG_RSP &&
+					xchg_memRSP_rdi->detail->x86.operands[0].mem.disp == 0 &&
+					xchg_memRSP_rdi->detail->x86.operands[1].type == X86_OP_REG &&
+					xchg_memRSP_rdi->detail->x86.operands[1].reg == mainREG &&
+
+					pop_rsp->id == X86_INS_POP&&
+					pop_rsp->detail->x86.operands[0].type == X86_OP_REG&&
+					pop_rsp->detail->x86.operands[0].reg == X86_REG_RSP)
+
+				{
+					// 清除原指令
+					DbgFunctions()->AssembleAtEx(push_rdi->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(mov_rdi_rsp->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(add_rdi_16->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(xchg_memRSP_rdi->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(pop_rsp->address, "NOP", 0, true);
+
+
+					// 生成 XCHG [RSP], reg
+					Environment env;
+					env.setArch(Arch::kX64);
+					CodeHolder code;
+					code.init(env);
+					x86::Assembler a(&code);
+					a.add(rsp, 0x8);
+
+					PBYTE tCode = new BYTE[code.codeSize()];
+					code.copyFlattenedData(tCode, code.codeSize());
+					DbgFunctions()->MemPatch(push_rdi->address, tCode, code.codeSize());
+					delete[] tCode;
+					code.reset();
+
+
+					modified = true;
+					break;
+				}
+			}
+		}
+
+
+		// 处理
+		/*
+		push rdi
+		mov rdi,rsp
+		xchg qword ptr ss:[rsp],rdi
+		pop rsp
+		*/
+		if (insn[i].id == X86_INS_POP) {
+			cs_x86* x86_this = &(insn[i].detail->x86);
+			if (x86_this->operands[0].type == X86_OP_REG && x86_this->operands[0].reg == X86_REG_RSP) {
+				// 获取前三条有效指令索引
+				int last1 = getLastInsIndex(insn, i);
+				if (last1 == -1) continue;
+
+				int last2 = getLastInsIndex(insn, last1);
+				if (last2 == -1) continue;
+
+				int last3 = getLastInsIndex(insn, last2);
+				if (last3 == -1) continue;
+
+
+				// 验证四指令模式
+				const cs_insn* push_rdi = &insn[last3];
+				const cs_insn* mov_rdi_rsp = &insn[last2];
+				const cs_insn* xchg_memRSP_rdi = &insn[last1];
+				const cs_insn* pop_rsp = &insn[i];
+				auto mainREG = push_rdi->detail->x86.operands[0].reg;
+
+				if (push_rdi->id == X86_INS_PUSH &&
+					push_rdi->detail->x86.operands[0].type == X86_OP_REG &&
+
+					mov_rdi_rsp->id == X86_INS_MOV &&
+					mov_rdi_rsp->detail->x86.operands[0].type == X86_OP_REG &&
+					mov_rdi_rsp->detail->x86.operands[0].reg == mainREG &&
+					mov_rdi_rsp->detail->x86.operands[1].type == X86_OP_REG &&
+					mov_rdi_rsp->detail->x86.operands[1].reg == X86_REG_RSP &&
+
+					xchg_memRSP_rdi->id == X86_INS_XCHG &&
+					xchg_memRSP_rdi->detail->x86.operands[0].type == X86_OP_MEM &&
+					xchg_memRSP_rdi->detail->x86.operands[0].mem.base == X86_REG_RSP &&
+					xchg_memRSP_rdi->detail->x86.operands[0].mem.disp == 0 &&
+					xchg_memRSP_rdi->detail->x86.operands[1].type == X86_OP_REG &&
+					xchg_memRSP_rdi->detail->x86.operands[1].reg == mainREG &&
+
+					pop_rsp->id == X86_INS_POP &&
+					pop_rsp->detail->x86.operands[0].type == X86_OP_REG &&
+					pop_rsp->detail->x86.operands[0].reg == X86_REG_RSP)
+
+				{
+					// 清除原指令
+					DbgFunctions()->AssembleAtEx(push_rdi->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(mov_rdi_rsp->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(xchg_memRSP_rdi->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(pop_rsp->address, "NOP", 0, true);
+
+
+					// 生成 XCHG [RSP], reg
+					Environment env;
+					env.setArch(Arch::kX64);
+					CodeHolder code;
+					code.init(env);
+					x86::Assembler a(&code);
+					a.sub(rsp, 0x8);
+					a.mov(qword_ptr(rsp), rsp);
+
+					PBYTE tCode = new BYTE[code.codeSize()];
+					code.copyFlattenedData(tCode, code.codeSize());
+					DbgFunctions()->MemPatch(push_rdi->address, tCode, code.codeSize());
+					delete[] tCode;
+					code.reset();
+
+
+					modified = true;
+					break;
+				}
+			}
+		}
+
+
+		// 处理
+		/*
+		mov [rsp], Imm1/Regxx
+		mov [rsp], Imm2/Reg
+		*/
+		if (insn[i].id == X86_INS_MOV) {
+			cs_x86* x86_this = &(insn[i].detail->x86);
+			if (x86_this->operands[0].type == X86_OP_MEM) {
+				// 获取前三条有效指令索引
+				int last1 = getLastInsIndex(insn, i);
+				if (last1 == -1) continue;
+
+				// 验证四指令模式
+				const cs_insn* mov_1 = &insn[last1];
+				const cs_insn* mov_2 = &insn[i];
+
+				if (mov_1->id == X86_INS_MOV && mov_2->id == X86_INS_MOV &&
+					mov_1->detail->x86.operands[0].type == X86_OP_MEM &&
+					mov_1->detail->x86.operands[0].mem.base == X86_REG_RSP &&
+					mov_1->detail->x86.operands[0].mem.disp == mov_2->detail->x86.operands[0].mem.disp&&
+
+					mov_2->detail->x86.operands[0].type == X86_OP_MEM &&
+					mov_2->detail->x86.operands[0].mem.base == X86_REG_RSP&&
+					mov_2->detail->x86.operands[0].mem.scale == 1 &&
+					mov_2->detail->x86.operands[0].mem.index == X86_REG_INVALID
+					)
+				{
+					// Check mop_2 is Imm/Reg
+					if (mov_2->detail->x86.operands[1].type == X86_OP_IMM)
+					{
+						// 清除原指令
+						DbgFunctions()->AssembleAtEx(mov_1->address, "NOP", 0, true);
+						DbgFunctions()->AssembleAtEx(mov_2->address, "NOP", 0, true);
+
+
+						// 生成 XCHG [RSP], reg
+						Environment env;
+						env.setArch(Arch::kX64);
+						CodeHolder code;
+						code.init(env);
+						x86::Assembler a(&code);
+						a.mov(qword_ptr(rsp, mov_2->detail->x86.operands[0].mem.disp), mov_2->detail->x86.operands[1].imm);
+
+						PBYTE tCode = new BYTE[code.codeSize()];
+						code.copyFlattenedData(tCode, code.codeSize());
+						DbgFunctions()->MemPatch(mov_1->address, tCode, code.codeSize());
+						delete[] tCode;
+						code.reset();
+
+
+						modified = true;
+						break;
+					}
+					else if (mov_2->detail->x86.operands[1].type == X86_OP_REG) {
+						// 清除原指令
+						DbgFunctions()->AssembleAtEx(mov_1->address, "NOP", 0, true);
+						DbgFunctions()->AssembleAtEx(mov_2->address, "NOP", 0, true);
+
+
+						// 生成 XCHG [RSP], reg
+						Environment env;
+						env.setArch(Arch::kX64);
+						CodeHolder code;
+						code.init(env);
+						x86::Assembler a(&code);
+						a.mov(qword_ptr(rsp, mov_2->detail->x86.operands[0].mem.disp), cvrtCsRegToGp(mov_2->detail->x86.operands[1].reg));
+
+						PBYTE tCode = new BYTE[code.codeSize()];
+						code.copyFlattenedData(tCode, code.codeSize());
+						DbgFunctions()->MemPatch(mov_1->address, tCode, code.codeSize());
+						delete[] tCode;
+						code.reset();
+
+
+						modified = true;
+						break;
+					}
+
+					
+				}
+			}
+		}
+
+		// 处理
+		/*
+		push rcx 
+		mov rcx,rbp
+		xor qword ptr ss:[rsp+0x8],rcx 
+		pop rcx
+		*/
+		if (insn[i].id == X86_INS_POP) {
+			cs_x86* x86_this = &(insn[i].detail->x86);
+			if (x86_this->operands[0].type == X86_OP_REG) {
+				// 获取前三条有效指令索引
+				int last1 = getLastInsIndex(insn, i);
+				if (last1 == -1) continue;
+
+				int last2 = getLastInsIndex(insn, last1);
+				if (last2 == -1) continue;
+
+				int last3 = getLastInsIndex(insn, last2);
+				if (last3 == -1) continue;
+
+
+				// 验证四指令模式
+				const cs_insn* push_rcx = &insn[last3];
+				const cs_insn* mov_rcx_rbp = &insn[last2];
+				const cs_insn* xor_rsp_8_rcx = &insn[last1];
+				const cs_insn* pop_rcx = &insn[i];
+				auto mainREG = push_rcx->detail->x86.operands[0].reg;
+
+				if (push_rcx->id == X86_INS_PUSH &&
+					push_rcx->detail->x86.operands[0].type == X86_OP_REG &&
+
+					mov_rcx_rbp->id == X86_INS_MOV &&
+					mov_rcx_rbp->detail->x86.operands[0].type == X86_OP_REG &&
+					mov_rcx_rbp->detail->x86.operands[0].reg == mainREG &&
+					mov_rcx_rbp->detail->x86.operands[1].type == X86_OP_REG &&
+
+					xor_rsp_8_rcx->id == X86_INS_XOR &&
+					xor_rsp_8_rcx->detail->x86.operands[0].type == X86_OP_MEM &&
+					xor_rsp_8_rcx->detail->x86.operands[0].mem.base == X86_REG_RSP &&
+					xor_rsp_8_rcx->detail->x86.operands[0].mem.disp == 8 &&
+					xor_rsp_8_rcx->detail->x86.operands[1].type == X86_OP_REG &&
+					xor_rsp_8_rcx->detail->x86.operands[1].reg == mainREG &&
+
+					pop_rcx->id == X86_INS_POP &&
+					pop_rcx->detail->x86.operands[0].type == X86_OP_REG &&
+					pop_rcx->detail->x86.operands[0].reg == mainREG)
+
+				{
+					// 清除原指令
+					DbgFunctions()->AssembleAtEx(push_rcx->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(mov_rcx_rbp->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(xor_rsp_8_rcx->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(pop_rcx->address, "NOP", 0, true);
+
+
+					// 生成 XCHG [RSP], reg
+					Environment env;
+					env.setArch(Arch::kX64);
+					CodeHolder code;
+					code.init(env);
+					x86::Assembler a(&code);
+					a.xor_(qword_ptr(rsp), cvrtCsRegToGp(mov_rcx_rbp->detail->x86.operands[1].reg));
+
+					PBYTE tCode = new BYTE[code.codeSize()];
+					code.copyFlattenedData(tCode, code.codeSize());
+					DbgFunctions()->MemPatch(push_rcx->address, tCode, code.codeSize());
+					delete[] tCode;
+					code.reset();
+
+
+					modified = true;
+					break;
+				}
+			}
+		}
+
+		// 处理
+		/*
+		push r14
+		sub rsp,0x8
+		mov qword ptr ss:[rsp],rsp
+		pop r14
+		add r14,0x18
+		xchg qword ptr ss:[rsp],r14
+		pop rsp
+		*/
+		if (insn[i].id == X86_INS_POP) {
+			cs_x86* x86_this = &(insn[i].detail->x86);
+			if (x86_this->operands[0].type == X86_OP_REG && x86_this->operands[0].reg == X86_REG_RSP) {
+				// 获取前三条有效指令索引
+				int last1 = getLastInsIndex(insn, i);
+				if (last1 == -1) continue;
+
+				int last2 = getLastInsIndex(insn, last1);
+				if (last2 == -1) continue;
+
+				int last3 = getLastInsIndex(insn, last2);
+				if (last3 == -1) continue;
+
+				int last4 = getLastInsIndex(insn, last3);
+				if (last4 == -1) continue;
+
+				int last5 = getLastInsIndex(insn, last4);
+				if (last5 == -1) continue;
+
+				int last6 = getLastInsIndex(insn, last5);
+				if (last6 == -1) continue;
+
+
+				// 验证四指令模式
+				const cs_insn* push_r14 = &insn[last6];
+				const cs_insn* sub_rsp_0x8 = &insn[last5];
+				const cs_insn* mov_mrsp_rsp = &insn[last4];
+				const cs_insn* pop_r14 = &insn[last3];
+				const cs_insn* add_r14_0x18 = &insn[last2];
+				const cs_insn* xchg_mrsp_r14 = &insn[last1];
+				const cs_insn* pop_rsp = &insn[i];
+
+				auto mainREG = push_r14->detail->x86.operands[0].reg;
+
+				if (push_r14->id == X86_INS_PUSH &&
+					push_r14->detail->x86.operands[0].type == X86_OP_REG &&
+
+					sub_rsp_0x8->id == X86_INS_SUB &&
+					sub_rsp_0x8->detail->x86.operands[0].type == X86_OP_REG &&
+					sub_rsp_0x8->detail->x86.operands[0].reg == X86_REG_RSP &&
+					sub_rsp_0x8->detail->x86.operands[1].type == X86_OP_IMM &&
+					sub_rsp_0x8->detail->x86.operands[1].imm == 0x8 &&
+
+					mov_mrsp_rsp->id == X86_INS_MOV &&
+					mov_mrsp_rsp->detail->x86.operands[0].type == X86_OP_MEM &&
+					mov_mrsp_rsp->detail->x86.operands[0].mem.base == X86_REG_RSP &&
+					mov_mrsp_rsp->detail->x86.operands[0].mem.disp == 0 &&
+					mov_mrsp_rsp->detail->x86.operands[1].type == X86_OP_REG &&
+					mov_mrsp_rsp->detail->x86.operands[1].reg == X86_REG_RSP &&
+
+					pop_r14->id == X86_INS_POP &&
+					pop_r14->detail->x86.operands[0].type == X86_OP_REG&&
+					pop_r14->detail->x86.operands[0].reg == mainREG&&
+
+					add_r14_0x18->id == X86_INS_ADD&&
+					add_r14_0x18->detail->x86.operands[0].type == X86_OP_REG&&
+					add_r14_0x18->detail->x86.operands[0].reg == mainREG&&
+					add_r14_0x18->detail->x86.operands[1].type == X86_OP_IMM&&
+					add_r14_0x18->detail->x86.operands[1].imm == 0x18 &&
+
+					xchg_mrsp_r14->id == X86_INS_XCHG&&
+					xchg_mrsp_r14->detail->x86.operands[0].type == X86_OP_MEM&&
+					xchg_mrsp_r14->detail->x86.operands[0].mem.base == X86_REG_RSP&&
+					xchg_mrsp_r14->detail->x86.operands[0].mem.disp == 0 &&
+					xchg_mrsp_r14->detail->x86.operands[1].type == X86_OP_REG&&
+					xchg_mrsp_r14->detail->x86.operands[1].reg == mainREG&&
+					pop_rsp->id == X86_INS_POP&&
+					pop_rsp->detail->x86.operands[0].type == X86_OP_REG&&
+					pop_rsp->detail->x86.operands[0].reg == X86_REG_RSP)
+				{
+					// 清除原指令
+					DbgFunctions()->AssembleAtEx(push_r14->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(sub_rsp_0x8->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(mov_mrsp_rsp->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(pop_r14->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(add_r14_0x18->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(xchg_mrsp_r14->address, "NOP", 0, true);
+					DbgFunctions()->AssembleAtEx(pop_rsp->address, "NOP", 0, true);
+
+
+					// 生成 XCHG [RSP], reg
+					Environment env;
+					env.setArch(Arch::kX64);
+					CodeHolder code;
+					code.init(env);
+					x86::Assembler a(&code);
+					a.add(rsp, 0x8);
+
+					PBYTE tCode = new BYTE[code.codeSize()];
+					code.copyFlattenedData(tCode, code.codeSize());
+					DbgFunctions()->MemPatch(push_r14->address, tCode, code.codeSize());
+					delete[] tCode;
+					code.reset();
+
+
+					modified = true;
+					break;
+				}
+			}
+		}
+
+
 	}
-	
+
+
 	return modified;
 }
 
@@ -792,18 +1693,18 @@ bool cleanCode2(const cs_insn* insn, size_t codeCount)
 			continue;
 		}
 
-	/*
-		if (insn[i].detail->regs_write_count == 1
-			&& insn[lastIndx].detail->regs_write_count == 1)
-		{
-			if (insn[i].detail->regs_write[0] == insn[lastIndx].detail->regs_write[0])
+		/*
+			if (insn[i].detail->regs_write_count == 1
+				&& insn[lastIndx].detail->regs_write_count == 1)
 			{
-				DbgFunctions()->AssembleAtEx(insn[lastIndx].address, "NOP", 0, true);
-				modified = true;
-				break;
+				if (insn[i].detail->regs_write[0] == insn[lastIndx].detail->regs_write[0])
+				{
+					DbgFunctions()->AssembleAtEx(insn[lastIndx].address, "NOP", 0, true);
+					modified = true;
+					break;
+				}
 			}
-		}
-	*/
+		*/
 	}
 	return modified;
 }

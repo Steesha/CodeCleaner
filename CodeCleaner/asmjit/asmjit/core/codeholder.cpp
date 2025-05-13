@@ -74,6 +74,7 @@ static void CodeHolder_resetInternal(CodeHolder* self, ResetPolicy resetPolicy) 
 
   // Reset everything into its construction state.
   self->_environment.reset();
+  self->_cpuFeatures.reset();
   self->_baseAddress = Globals::kNoBaseAddress;
   self->_logger = nullptr;
   self->_errorHandler = nullptr;
@@ -118,10 +119,11 @@ static void CodeHolder_onSettingsUpdated(CodeHolder* self) noexcept {
 
 CodeHolder::CodeHolder(const Support::Temporary* temporary) noexcept
   : _environment(),
+    _cpuFeatures{},
     _baseAddress(Globals::kNoBaseAddress),
     _logger(nullptr),
     _errorHandler(nullptr),
-    _zone(16384 - Zone::kBlockOverhead, 1, temporary),
+    _zone(16u * 1024u, 1, temporary),
     _allocator(&_zone),
     _unresolvedLinkCount(0),
     _addressTableSection(nullptr) {}
@@ -130,8 +132,8 @@ CodeHolder::~CodeHolder() noexcept {
   CodeHolder_resetInternal(this, ResetPolicy::kHard);
 }
 
-// CodeHolder - Init & Reset
-// =========================
+// CodeHolder - Initialization & Reset
+// ===================================
 
 inline void CodeHolder_setSectionDefaultName(
   Section* section,
@@ -143,6 +145,10 @@ inline void CodeHolder_setSectionDefaultName(
 }
 
 Error CodeHolder::init(const Environment& environment, uint64_t baseAddress) noexcept {
+  return init(environment, CpuFeatures{}, baseAddress);
+}
+
+Error CodeHolder::init(const Environment& environment, const CpuFeatures& cpuFeatures, uint64_t baseAddress) noexcept {
   // Cannot reinitialize if it's locked or there is one or more emitter attached.
   if (isInitialized())
     return DebugUtils::errored(kErrorAlreadyInitialized);
@@ -172,6 +178,7 @@ Error CodeHolder::init(const Environment& environment, uint64_t baseAddress) noe
   }
   else {
     _environment = environment;
+    _cpuFeatures = cpuFeatures;
     _baseAddress = baseAddress;
     return kErrorOk;
   }
@@ -193,6 +200,10 @@ Error CodeHolder::attach(BaseEmitter* emitter) noexcept {
   EmitterType type = emitter->emitterType();
   if (ASMJIT_UNLIKELY(type == EmitterType::kNone || uint32_t(type) > uint32_t(EmitterType::kMaxValue)))
     return DebugUtils::errored(kErrorInvalidState);
+
+  uint64_t archMask = emitter->_archMask;
+  if (ASMJIT_UNLIKELY(!(archMask & (uint64_t(1) << uint32_t(arch())))))
+    return DebugUtils::errored(kErrorInvalidArch);
 
   // This is suspicious, but don't fail if `emitter` is already attached
   // to this code holder. This is not error, but it's not recommended.
@@ -897,7 +908,7 @@ size_t CodeHolder::codeSize() const noexcept {
     }
   }
 
-  if ((sizeof(uint64_t) > sizeof(size_t) && offset > SIZE_MAX) || of)
+  if ((sizeof(uint64_t) > sizeof(size_t) && offset > uint64_t(SIZE_MAX)) || of)
     return SIZE_MAX;
 
   return size_t(offset);
@@ -944,7 +955,6 @@ Error CodeHolder::relocateToBase(uint64_t baseAddress) noexcept {
       return DebugUtils::errored(kErrorInvalidRelocEntry);
 
     uint8_t* buffer = sourceSection->data();
-    size_t valueOffset = size_t(re->sourceOffset()) + re->format().valueOffset();
 
     switch (re->relocType()) {
       case RelocType::kExpression: {
@@ -970,12 +980,18 @@ Error CodeHolder::relocateToBase(uint64_t baseAddress) noexcept {
 
       case RelocType::kAbsToRel: {
         value -= baseAddress + sectionOffset + sourceOffset + regionSize;
-        if (addressSize > 4 && !Support::isInt32(int64_t(value)))
+
+        // Sign extend as we are not interested in the high 32-bit word in a 32-bit address space.
+        if (addressSize <= 4)
+          value = uint64_t(int64_t(int32_t(value & 0xFFFFFFFFu)));
+        else if (!Support::isInt32(int64_t(value)))
           return DebugUtils::errored(kErrorRelocOffsetOutOfRange);
+
         break;
       }
 
       case RelocType::kX64AddressEntry: {
+        size_t valueOffset = size_t(re->sourceOffset()) + re->format().valueOffset();
         if (re->format().valueSize() != 4 || valueOffset < 2)
           return DebugUtils::errored(kErrorInvalidRelocEntry);
 
@@ -1030,25 +1046,8 @@ Error CodeHolder::relocateToBase(uint64_t baseAddress) noexcept {
         return DebugUtils::errored(kErrorInvalidRelocEntry);
     }
 
-    switch (re->format().valueSize()) {
-      case 1:
-        Support::writeU8(buffer + valueOffset, uint8_t(value & 0xFFu));
-        break;
-
-      case 2:
-        Support::writeU16uLE(buffer + valueOffset, uint16_t(value & 0xFFFFu));
-        break;
-
-      case 4:
-        Support::writeU32uLE(buffer + valueOffset, uint32_t(value & 0xFFFFFFFFu));
-        break;
-
-      case 8:
-        Support::writeU64uLE(buffer + valueOffset, value);
-        break;
-
-      default:
-        return DebugUtils::errored(kErrorInvalidRelocEntry);
+    if (!CodeWriterUtils::writeOffset(buffer + re->sourceOffset(), int64_t(value), re->format())) {
+      return DebugUtils::errored(kErrorInvalidRelocEntry);
     }
   }
 
@@ -1127,30 +1126,30 @@ UNIT(code_holder) {
   env.init(Arch::kX86);
 
   code.init(env);
-  EXPECT(code.arch() == Arch::kX86);
+  EXPECT_EQ(code.arch(), Arch::kX86);
 
   INFO("Verifying named labels");
   LabelEntry* le;
-  EXPECT(code.newNamedLabelEntry(&le, "NamedLabel", SIZE_MAX, LabelType::kGlobal) == kErrorOk);
-  EXPECT(strcmp(le->name(), "NamedLabel") == 0);
-  EXPECT(code.labelIdByName("NamedLabel") == le->id());
+  EXPECT_EQ(code.newNamedLabelEntry(&le, "NamedLabel", SIZE_MAX, LabelType::kGlobal), kErrorOk);
+  EXPECT_EQ(strcmp(le->name(), "NamedLabel"), 0);
+  EXPECT_EQ(code.labelIdByName("NamedLabel"), le->id());
 
   INFO("Verifying section ordering");
   Section* section1;
-  EXPECT(code.newSection(&section1, "high-priority", SIZE_MAX, SectionFlags::kNone, 1, -1) == kErrorOk);
-  EXPECT(code.sections()[1] == section1);
-  EXPECT(code.sectionsByOrder()[0] == section1);
+  EXPECT_EQ(code.newSection(&section1, "high-priority", SIZE_MAX, SectionFlags::kNone, 1, -1), kErrorOk);
+  EXPECT_EQ(code.sections()[1], section1);
+  EXPECT_EQ(code.sectionsByOrder()[0], section1);
 
   Section* section0;
-  EXPECT(code.newSection(&section0, "higher-priority", SIZE_MAX, SectionFlags::kNone, 1, -2) == kErrorOk);
-  EXPECT(code.sections()[2] == section0);
-  EXPECT(code.sectionsByOrder()[0] == section0);
-  EXPECT(code.sectionsByOrder()[1] == section1);
+  EXPECT_EQ(code.newSection(&section0, "higher-priority", SIZE_MAX, SectionFlags::kNone, 1, -2), kErrorOk);
+  EXPECT_EQ(code.sections()[2], section0);
+  EXPECT_EQ(code.sectionsByOrder()[0], section0);
+  EXPECT_EQ(code.sectionsByOrder()[1], section1);
 
   Section* section3;
-  EXPECT(code.newSection(&section3, "low-priority", SIZE_MAX, SectionFlags::kNone, 1, 2) == kErrorOk);
-  EXPECT(code.sections()[3] == section3);
-  EXPECT(code.sectionsByOrder()[3] == section3);
+  EXPECT_EQ(code.newSection(&section3, "low-priority", SIZE_MAX, SectionFlags::kNone, 1, 2), kErrorOk);
+  EXPECT_EQ(code.sections()[3], section3);
+  EXPECT_EQ(code.sectionsByOrder()[3], section3);
 }
 #endif
 

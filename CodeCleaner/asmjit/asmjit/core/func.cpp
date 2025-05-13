@@ -14,14 +14,14 @@
   #include "../x86/x86func_p.h"
 #endif
 
-#ifdef ASMJIT_BUILD_ARM
-  #include "../arm/armfunc_p.h"
+#if !defined(ASMJIT_NO_AARCH64)
+  #include "../arm/a64func_p.h"
 #endif
 
 ASMJIT_BEGIN_NAMESPACE
 
-// CallConv - Init & Reset
-// =======================
+// CallConv - Initialization & Reset
+// =================================
 
 ASMJIT_FAVOR_SIZE Error CallConv::init(CallConvId ccId, const Environment& environment) noexcept {
   reset();
@@ -31,9 +31,9 @@ ASMJIT_FAVOR_SIZE Error CallConv::init(CallConvId ccId, const Environment& envir
     return x86::FuncInternal::initCallConv(*this, ccId, environment);
 #endif
 
-#ifdef ASMJIT_BUILD_ARM
-  if (environment.isFamilyARM())
-    return arm::FuncInternal::initCallConv(*this, ccId, environment);
+#if !defined(ASMJIT_NO_AARCH64)
+  if (environment.isFamilyAArch64())
+    return a64::FuncInternal::initCallConv(*this, ccId, environment);
 #endif
 
   return DebugUtils::errored(kErrorInvalidArgument);
@@ -73,9 +73,9 @@ ASMJIT_FAVOR_SIZE Error FuncDetail::init(const FuncSignature& signature, const E
     return x86::FuncInternal::initFuncDetail(*this, signature, registerSize);
 #endif
 
-#ifdef ASMJIT_BUILD_ARM
-  if (environment.isFamilyARM())
-    return arm::FuncInternal::initFuncDetail(*this, signature, registerSize);
+#if !defined(ASMJIT_NO_AARCH64)
+  if (environment.isFamilyAArch64())
+    return a64::FuncInternal::initFuncDetail(*this, signature);
 #endif
 
   // We should never bubble here as if `cc.init()` succeeded then there has to be an implementation for the current
@@ -282,5 +282,19 @@ ASMJIT_FAVOR_SIZE Error FuncArgsAssignment::updateFuncFrame(FuncFrame& frame) co
   ASMJIT_PROPAGATE(ctx.markStackArgsReg(frame));
   return kErrorOk;
 }
+
+// Func API - Tests
+// ================
+
+#if defined(ASMJIT_TEST)
+UNIT(func_signature) {
+  FuncSignature signature;
+  signature.setRetT<int8_t>();
+  signature.addArgT<int16_t>();
+  signature.addArg(TypeId::kInt32);
+
+  EXPECT_EQ(signature, FuncSignature::build<int8_t, int16_t, int32_t>());
+}
+#endif
 
 ASMJIT_END_NAMESPACE

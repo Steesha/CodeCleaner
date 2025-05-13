@@ -25,53 +25,53 @@ class RALocalAllocator {
 public:
   ASMJIT_NONCOPYABLE(RALocalAllocator)
 
-  typedef RAAssignment::PhysToWorkMap PhysToWorkMap;
-  typedef RAAssignment::WorkToPhysMap WorkToPhysMap;
+  using PhysToWorkMap = RAAssignment::PhysToWorkMap;
+  using WorkToPhysMap = RAAssignment::WorkToPhysMap;
 
   //! Link to `BaseRAPass`.
-  BaseRAPass* _pass;
+  BaseRAPass* _pass {};
   //! Link to `BaseCompiler`.
-  BaseCompiler* _cc;
+  BaseCompiler* _cc {};
 
   //! Architecture traits.
-  const ArchTraits* _archTraits;
+  const ArchTraits* _archTraits {};
   //! Registers available to the allocator.
-  RARegMask _availableRegs;
+  RARegMask _availableRegs {};
   //! Registers clobbered by the allocator.
-  RARegMask _clobberedRegs;
+  RARegMask _clobberedRegs {};
+  //! Registers that must be preserved by the function (clobbering means saving & restoring in function prolog & epilog).
+  RARegMask _funcPreservedRegs {};
 
   //! Register assignment (current).
-  RAAssignment _curAssignment;
+  RAAssignment _curAssignment {};
   //! Register assignment used temporarily during assignment switches.
-  RAAssignment _tmpAssignment;
+  RAAssignment _tmpAssignment {};
 
   //! Link to the current `RABlock`.
-  RABlock* _block;
+  RABlock* _block {};
   //! InstNode.
-  InstNode* _node;
+  InstNode* _node {};
   //! RA instruction.
-  RAInst* _raInst;
+  RAInst* _raInst {};
 
   //! Count of all TiedReg's.
-  uint32_t _tiedTotal;
+  uint32_t _tiedTotal {};
   //! TiedReg's total counter.
-  RARegCount _tiedCount;
+  RARegCount _tiedCount {};
+
+  //! Temporary workToPhysMap that can be used freely by the allocator.
+  WorkToPhysMap* _tmpWorkToPhysMap {};
 
   //! \name Construction & Destruction
   //! \{
 
-  inline RALocalAllocator(BaseRAPass* pass) noexcept
+  inline explicit RALocalAllocator(BaseRAPass* pass) noexcept
     : _pass(pass),
       _cc(pass->cc()),
       _archTraits(pass->_archTraits),
-      _availableRegs(pass->_availableRegs),
-      _clobberedRegs(),
-      _curAssignment(),
-      _block(nullptr),
-      _node(nullptr),
-      _raInst(nullptr),
-      _tiedTotal(),
-      _tiedCount() {}
+      _availableRegs(pass->_availableRegs) {
+    _funcPreservedRegs.init(pass->func()->frame().preservedRegs());
+  }
 
   Error init() noexcept;
 
@@ -80,31 +80,31 @@ public:
   //! \name Accessors
   //! \{
 
-  inline RAWorkReg* workRegById(uint32_t workId) const noexcept { return _pass->workRegById(workId); }
-  inline PhysToWorkMap* physToWorkMap() const noexcept { return _curAssignment.physToWorkMap(); }
-  inline WorkToPhysMap* workToPhysMap() const noexcept { return _curAssignment.workToPhysMap(); }
+  ASMJIT_INLINE_NODEBUG RAWorkReg* workRegById(uint32_t workId) const noexcept { return _pass->workRegById(workId); }
+  ASMJIT_INLINE_NODEBUG PhysToWorkMap* physToWorkMap() const noexcept { return _curAssignment.physToWorkMap(); }
+  ASMJIT_INLINE_NODEBUG WorkToPhysMap* workToPhysMap() const noexcept { return _curAssignment.workToPhysMap(); }
 
   //! Returns the currently processed block.
-  inline RABlock* block() const noexcept { return _block; }
+  ASMJIT_INLINE_NODEBUG RABlock* block() const noexcept { return _block; }
   //! Sets the currently processed block.
-  inline void setBlock(RABlock* block) noexcept { _block = block; }
+  ASMJIT_INLINE_NODEBUG void setBlock(RABlock* block) noexcept { _block = block; }
 
   //! Returns the currently processed `InstNode`.
-  inline InstNode* node() const noexcept { return _node; }
+  ASMJIT_INLINE_NODEBUG InstNode* node() const noexcept { return _node; }
   //! Returns the currently processed `RAInst`.
-  inline RAInst* raInst() const noexcept { return _raInst; }
+  ASMJIT_INLINE_NODEBUG RAInst* raInst() const noexcept { return _raInst; }
 
   //! Returns all tied regs as `RATiedReg` array.
-  inline RATiedReg* tiedRegs() const noexcept { return _raInst->tiedRegs(); }
+  ASMJIT_INLINE_NODEBUG RATiedReg* tiedRegs() const noexcept { return _raInst->tiedRegs(); }
   //! Returns tied registers grouped by the given `group`.
-  inline RATiedReg* tiedRegs(RegGroup group) const noexcept { return _raInst->tiedRegs(group); }
+  ASMJIT_INLINE_NODEBUG RATiedReg* tiedRegs(RegGroup group) const noexcept { return _raInst->tiedRegs(group); }
 
   //! Returns count of all TiedRegs used by the instruction.
-  inline uint32_t tiedCount() const noexcept { return _tiedTotal; }
+  ASMJIT_INLINE_NODEBUG uint32_t tiedCount() const noexcept { return _tiedTotal; }
   //! Returns count of TiedRegs used by the given register `group`.
-  inline uint32_t tiedCount(RegGroup group) const noexcept { return _tiedCount.get(group); }
+  ASMJIT_INLINE_NODEBUG uint32_t tiedCount(RegGroup group) const noexcept { return _tiedCount.get(group); }
 
-  inline bool isGroupUsed(RegGroup group) const noexcept { return _tiedCount[group] != 0; }
+  ASMJIT_INLINE_NODEBUG bool isGroupUsed(RegGroup group) const noexcept { return _tiedCount[group] != 0; }
 
   //! \}
 
@@ -113,9 +113,7 @@ public:
 
   Error makeInitialAssignment() noexcept;
 
-  Error replaceAssignment(
-    const PhysToWorkMap* physToWorkMap,
-    const WorkToPhysMap* workToPhysMap) noexcept;
+  Error replaceAssignment(const PhysToWorkMap* physToWorkMap) noexcept;
 
   //! Switch to the given assignment by reassigning all register and emitting code that reassigns them.
   //! This is always used to switch to a previously stored assignment.
@@ -123,14 +121,9 @@ public:
   //! If `tryMode` is true then the final assignment doesn't have to be exactly same as specified by `dstPhysToWorkMap`
   //! and `dstWorkToPhysMap`. This mode is only used before conditional jumps that already have assignment to generate
   //! a code sequence that is always executed regardless of the flow.
-  Error switchToAssignment(
-    PhysToWorkMap* dstPhysToWorkMap,
-    WorkToPhysMap* dstWorkToPhysMap,
-    const ZoneBitVector& liveIn,
-    bool dstReadOnly,
-    bool tryMode) noexcept;
+  Error switchToAssignment(PhysToWorkMap* dstPhysToWorkMap, const ZoneBitVector& liveIn, bool dstReadOnly, bool tryMode) noexcept;
 
-  inline Error spillRegsBeforeEntry(RABlock* block) noexcept {
+  ASMJIT_INLINE_NODEBUG Error spillRegsBeforeEntry(RABlock* block) noexcept {
     return spillScratchGpRegsBeforeEntry(block->entryScratchGpRegs());
   }
 
@@ -157,11 +150,11 @@ public:
     kCostOfDirtyFlag = kCostOfFrequency / 4
   };
 
-  inline uint32_t costByFrequency(float freq) const noexcept {
+  ASMJIT_INLINE_NODEBUG uint32_t costByFrequency(float freq) const noexcept {
     return uint32_t(int32_t(freq * float(kCostOfFrequency)));
   }
 
-  inline uint32_t calculateSpillCost(RegGroup group, uint32_t workId, uint32_t assignedId) const noexcept {
+  ASMJIT_FORCE_INLINE uint32_t calculateSpillCost(RegGroup group, uint32_t workId, uint32_t assignedId) const noexcept {
     RAWorkReg* workReg = workRegById(workId);
     uint32_t cost = costByFrequency(workReg->liveStats().freq());
 
@@ -169,6 +162,18 @@ public:
       cost += kCostOfDirtyFlag;
 
     return cost;
+  }
+
+  ASMJIT_FORCE_INLINE uint32_t pickBestSuitableRegister(RegGroup group, RegMask allocableRegs) const noexcept {
+    // These are registers must be preserved by the function itself.
+    RegMask preservedRegs = _funcPreservedRegs[group];
+
+    // Reduce the set by removing preserved registers when possible.
+    if (allocableRegs & ~preservedRegs) {
+      allocableRegs &= ~preservedRegs;
+    }
+
+    return Support::ctz(allocableRegs);
   }
 
   //! Decides on register assignment.
@@ -180,7 +185,7 @@ public:
   //! The function must return either `RAAssignment::kPhysNone`, which means that the WorkReg of `workId` should be
   //! spilled, or a valid physical register ID, which means that the register should be moved to that physical register
   //! instead.
-  uint32_t decideOnReassignment(RegGroup group, uint32_t workId, uint32_t assignedId, RegMask allocableRegs) const noexcept;
+  uint32_t decideOnReassignment(RegGroup group, uint32_t workId, uint32_t assignedId, RegMask allocableRegs, RAInst* raInst) const noexcept;
 
   //! Decides on best spill given a register mask `spillableRegs`
   uint32_t decideOnSpillFor(RegGroup group, uint32_t workId, RegMask spillableRegs, uint32_t* spillWorkId) const noexcept;
@@ -193,7 +198,10 @@ public:
   //! Emits a move between a destination and source register, and fixes the
   //! register assignment.
   inline Error onMoveReg(RegGroup group, uint32_t workId, uint32_t dstPhysId, uint32_t srcPhysId) noexcept {
-    if (dstPhysId == srcPhysId) return kErrorOk;
+    if (dstPhysId == srcPhysId) {
+      return kErrorOk;
+    }
+
     _curAssignment.reassign(group, workId, dstPhysId, srcPhysId);
     return _pass->emitMove(workId, dstPhysId, srcPhysId);
   }

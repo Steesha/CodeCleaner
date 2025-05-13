@@ -20,8 +20,8 @@
   #include "../x86/x86formatter_p.h"
 #endif
 
-#ifdef ASMJIT_BUILD_ARM
-  #include "../arm/armformatter_p.h"
+#if !defined(ASMJIT_NO_AARCH64)
+  #include "../arm/a64formatter_p.h"
 #endif
 
 ASMJIT_BEGIN_NAMESPACE
@@ -57,7 +57,7 @@ Error formatTypeId(String& sb, TypeId typeId) noexcept {
   if (!TypeUtils::isValid(typeId))
     return sb.append("unknown");
 
-  const char* typeName = "unknown";
+  const char* typeName = nullptr;
   uint32_t typeSize = TypeUtils::sizeOf(typeId);
   TypeId scalarType = TypeUtils::scalarOf(typeId);
 
@@ -107,7 +107,7 @@ Error formatFeature(
     return x86::FormatterInternal::formatFeature(sb, featureId);
 #endif
 
-#ifdef ASMJIT_BUILD_ARM
+#if !defined(ASMJIT_NO_AARCH64)
   if (Environment::isFamilyARM(arch))
     return arm::FormatterInternal::formatFeature(sb, featureId);
 #endif
@@ -123,32 +123,33 @@ Error formatLabel(
 
   DebugUtils::unused(formatFlags);
 
-  const LabelEntry* le = emitter->code()->labelEntry(labelId);
-  if (ASMJIT_UNLIKELY(!le))
-    return sb.appendFormat("<InvalidLabel:%u>", labelId);
+  if (emitter && emitter->code()) {
+    const LabelEntry* le = emitter->code()->labelEntry(labelId);
+    if (ASMJIT_UNLIKELY(!le))
+      return sb.appendFormat("<InvalidLabel:%u>", labelId);
 
-  if (le->hasName()) {
-    if (le->hasParent()) {
-      uint32_t parentId = le->parentId();
-      const LabelEntry* pe = emitter->code()->labelEntry(parentId);
+    if (le->hasName()) {
+      if (le->hasParent()) {
+        uint32_t parentId = le->parentId();
+        const LabelEntry* pe = emitter->code()->labelEntry(parentId);
 
-      if (ASMJIT_UNLIKELY(!pe))
-        ASMJIT_PROPAGATE(sb.appendFormat("<InvalidLabel:%u>", labelId));
-      else if (ASMJIT_UNLIKELY(!pe->hasName()))
-        ASMJIT_PROPAGATE(sb.appendFormat("L%u", parentId));
-      else
-        ASMJIT_PROPAGATE(sb.append(pe->name()));
+        if (ASMJIT_UNLIKELY(!pe))
+          ASMJIT_PROPAGATE(sb.appendFormat("<InvalidLabel:%u>", labelId));
+        else if (ASMJIT_UNLIKELY(!pe->hasName()))
+          ASMJIT_PROPAGATE(sb.appendFormat("L%u", parentId));
+        else
+          ASMJIT_PROPAGATE(sb.append(pe->name()));
 
-      ASMJIT_PROPAGATE(sb.append('.'));
+        ASMJIT_PROPAGATE(sb.append('.'));
+      }
+
+      if (le->type() == LabelType::kAnonymous)
+        ASMJIT_PROPAGATE(sb.appendFormat("L%u@", labelId));
+      return sb.append(le->name());
     }
+  }
 
-    if (le->type() == LabelType::kAnonymous)
-      ASMJIT_PROPAGATE(sb.append("L%u@", labelId));
-    return sb.append(le->name());
-  }
-  else {
-    return sb.appendFormat("L%u", labelId);
-  }
+  return sb.appendFormat("L%u", labelId);
 }
 
 Error formatRegister(
@@ -164,7 +165,7 @@ Error formatRegister(
     return x86::FormatterInternal::formatRegister(sb, formatFlags, emitter, arch, regType, regId);
 #endif
 
-#ifdef ASMJIT_BUILD_ARM
+#if !defined(ASMJIT_NO_AARCH64)
   if (Environment::isFamilyARM(arch))
     return arm::FormatterInternal::formatRegister(sb, formatFlags, emitter, arch, regType, regId);
 #endif
@@ -184,7 +185,7 @@ Error formatOperand(
     return x86::FormatterInternal::formatOperand(sb, formatFlags, emitter, arch, op);
 #endif
 
-#ifdef ASMJIT_BUILD_ARM
+#if !defined(ASMJIT_NO_AARCH64)
   if (Environment::isFamilyARM(arch))
     return arm::FormatterInternal::formatOperand(sb, formatFlags, emitter, arch, op);
 #endif
@@ -282,9 +283,9 @@ Error formatInstruction(
     return x86::FormatterInternal::formatInstruction(sb, formatFlags, emitter, arch, inst, operands, opCount);
 #endif
 
-#ifdef ASMJIT_BUILD_ARM
-  if (Environment::isFamilyARM(arch))
-    return arm::FormatterInternal::formatInstruction(sb, formatFlags, emitter, arch, inst, operands, opCount);
+#if !defined(ASMJIT_NO_AARCH64)
+  if (Environment::isFamilyAArch64(arch))
+    return a64::FormatterInternal::formatInstruction(sb, formatFlags, emitter, arch, inst, operands, opCount);
 #endif
 
   return kErrorInvalidArch;
@@ -408,7 +409,7 @@ Error formatNode(
     case NodeType::kInst:
     case NodeType::kJump: {
       const InstNode* instNode = node->as<InstNode>();
-      ASMJIT_PROPAGATE(formatInstruction(sb, formatOptions.flags(), builder,
+      ASMJIT_PROPAGATE(builder->_funcs.formatInstruction(sb, formatOptions.flags(), builder,
         builder->arch(),
         instNode->baseInst(), instNode->operands(), instNode->opCount()));
       break;
@@ -471,8 +472,7 @@ Error formatNode(
 
     case NodeType::kComment: {
       const CommentNode* commentNode = node->as<CommentNode>();
-      ASMJIT_PROPAGATE(sb.appendFormat("; %s", commentNode->inlineComment()));
-      break;
+      return sb.appendFormat("; %s", commentNode->inlineComment());
     }
 
     case NodeType::kSentinel: {
@@ -514,7 +514,7 @@ Error formatNode(
       ASMJIT_PROPAGATE(sb.append("[FuncRet]"));
 
       for (uint32_t i = 0; i < 2; i++) {
-        const Operand_& op = retNode->_opArray[i];
+        const Operand_& op = retNode->op(i);
         if (!op.isNone()) {
           ASMJIT_PROPAGATE(sb.append(i == 0 ? " " : ", "));
           ASMJIT_PROPAGATE(formatOperand(sb, formatOptions.flags(), builder, builder->arch(), op));
@@ -525,7 +525,7 @@ Error formatNode(
 
     case NodeType::kInvoke: {
       const InvokeNode* invokeNode = node->as<InvokeNode>();
-      ASMJIT_PROPAGATE(formatInstruction(sb, formatOptions.flags(), builder,
+      ASMJIT_PROPAGATE(builder->_funcs.formatInstruction(sb, formatOptions.flags(), builder,
         builder->arch(),
         invokeNode->baseInst(), invokeNode->operands(), invokeNode->opCount()));
       break;
