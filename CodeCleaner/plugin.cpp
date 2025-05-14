@@ -981,6 +981,7 @@ bool cleanCode(const cs_insn* insn, size_t codeCount)
 		/*
 		add reg, Imm1
 		add reg, Imm2
+		|Imm1 + Imm2| <= 0xFFFF
 		*/
 		if (insn[i].id == X86_INS_ADD)
 		{
@@ -1007,20 +1008,10 @@ bool cleanCode(const cs_insn* insn, size_t codeCount)
 					if (reg1 != reg2)
 						continue; // 寄存器不同则跳过
 
-					// 获取寄存器位宽
-					int reg_size = getRegBitWidth(reg1);
-					
-
-					// BUG
-					uint64_t max_imm = (1ULL << reg_size) - 1;
 					uint64_t imm_total =
 						add_r1->detail->x86.operands[1].imm +
 						add_r2->detail->x86.operands[1].imm;
-					_plugin_logprintf("imm_total=%llu", imm_total);
-					_plugin_logprintf("max_imm=%llu", max_imm);
-
-					if (imm_total > max_imm)
-						continue; // 立即数溢出则不优化
+					if (imm_total > 0xffff) continue;
 
 
 
@@ -1034,24 +1025,8 @@ bool cleanCode(const cs_insn* insn, size_t codeCount)
 					CodeHolder code;
 					code.init(env);
 					x86::Assembler a(&code);
-
-					// 根据寄存器位宽选择正确的操作数
-					switch (reg_size)
-					{
-					case 64:
-						a.add(cvrtCsRegToGp(reg1).r8(), imm_total & 0xffffffffffffffff);
-						break;
-
-					case 32:
-						a.add(cvrtCsRegToGp(reg1).r32(), imm_total & 0xffffffff);
-						break;
-					case 16:
-						a.add(cvrtCsRegToGp(reg1).r16(), imm_total & 0xffff);
-						break;
-					case 8:
-						a.add(cvrtCsRegToGp(reg1).r8(), imm_total & 0xff);
-						break;
-					}
+					a.add(cvrtCsRegToGp(add_r1->detail->x86.operands[0].reg),
+						imm_total);
 
 					// 写入原第一条 ADD 的地址
 					PBYTE tCode = new BYTE[code.codeSize()];
